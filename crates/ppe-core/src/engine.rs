@@ -542,6 +542,22 @@ struct AnnotationKey {
     hook_name: String,
 }
 
+/// Keeps config replacement from crossing an in-progress initialization.
+///
+/// The counter rather than a boolean preserves the barrier if two callers
+/// initialize concurrently and one returns before the other. The runtime
+/// writer serializes entering initialization with the final publication step
+/// of [`PolicyEngine::load_config`].
+struct InitializationInFlight<'a> {
+    count: &'a AtomicUsize,
+}
+
+impl Drop for InitializationInFlight<'_> {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::Release);
+    }
+}
+
 /// Owns registered plugins and dispatches hook invocations to them.
 pub struct PolicyEngine {
     /// Hot-path runtime state. Swapped atomically on registration / config
@@ -595,6 +611,13 @@ pub struct PolicyEngine {
     /// Whether `initialize()` has been called. Atomic so lifecycle methods
     /// can be `&self` and the engine itself can sit behind `Arc`.
     initialized: AtomicBool,
+
+    /// How many `initialize()` calls are currently past their lifecycle gate.
+    /// A config load cannot publish while this is non-zero: initialization
+    /// resolves secrets and attaches them to the runtime in separate steps, so
+    /// replacing the document between those steps could pair one document's
+    /// bindings with another document's policy.
+    initializations_in_flight: AtomicUsize,
 
     /// Monotonic config-generation counter. Bumped every time the runtime
     /// snapshot is swapped (factory mutation, config (re)load, plugin
@@ -757,13 +780,22 @@ fn refuse_changed_secrets(
         return Ok(());
     };
     let message = format!(
-        "the `secrets:` block changed after startup: {change}. Secrets are resolved once, during \
-         initialize(), so applying this takes a restart"
+        "the `secrets:` block changed after secret resolution: {change}. Secrets are resolved \
+         once, during initialize(), so applying this takes a restart"
     );
     // Logged as well as returned: a host that reports a failed reload as one
     // line loses which declaration caused it.
     warn!("{message}");
     Err(Box::new(PluginError::Config { message }))
+}
+
+/// A config snapshot and its resolved secrets have to cross initialization as
+/// one unit. The caller may retry as soon as the in-progress call returns.
+fn config_load_during_initialization() -> Box<PluginError> {
+    Box::new(PluginError::Config {
+        message: "cannot load config while initialize() is in progress; retry after it returns"
+            .to_owned(),
+    })
 }
 
 /// The content provenance key a config calls for, from the secrets resolved
@@ -1087,6 +1119,7 @@ impl PolicyEngine {
             route_response_assertions_unreachable_warned: AtomicBool::new(false),
             executor_depth: AtomicUsize::new(0),
             initialized: AtomicBool::new(false),
+            initializations_in_flight: AtomicUsize::new(0),
             generation: AtomicU64::new(0),
             runtime_write: Mutex::new(()),
             task_tracker: tokio_util::task::TaskTracker::new(),
@@ -1342,9 +1375,9 @@ impl PolicyEngine {
     ///
     /// Returns `PluginError::Config` when the config fails validation, when a
     /// plugin's `kind` has no registered factory, when a factory rejects the
-    /// plugin's config, or when a registration conflicts with one already
-    /// present. The existing snapshot is left in place, so a failed load does
-    /// not disturb in-flight requests.
+    /// plugin's config, when initialization is in progress, or when a
+    /// registration conflicts with one already present. The existing snapshot
+    /// is left in place, so a failed load does not disturb in-flight requests.
     pub fn load_config(&self, policy_config: PolicyConfig) -> Result<(), Box<PluginError>> {
         // Warn before validating: an operator whose config both sets an inactive
         // knob and fails validation should see both, not just the refusal.
@@ -1358,7 +1391,10 @@ impl PolicyEngine {
         // Ahead of plugin instantiation: a document that cannot be applied
         // should not run factory code on its way to being refused, and a
         // factory is free to register things as it goes.
-        if self.initialized.load(Ordering::Acquire) {
+        if self.initializations_in_flight.load(Ordering::Acquire) != 0 {
+            return Err(config_load_during_initialization());
+        }
+        if self.initialized.load(Ordering::Acquire) || self.secrets.get().is_some() {
             refuse_changed_secrets(self.secrets.get().map(Arc::as_ref), &policy_config)?;
         }
         warn_on_dropped_inherited_authentication(&policy_config);
@@ -1377,13 +1413,6 @@ impl PolicyEngine {
             resolve_factories(&policy_config.plugins, &registry)?
         };
         let instances = create_plugin_instances(&policy_config.plugins, &factories)?;
-        let content_key = if self.initialized.load(Ordering::Acquire) {
-            let empty = crate::secrets::SecretStore::empty();
-            let store = self.secrets.get().map_or(&empty, |s| s.as_ref());
-            content_key_for(&policy_config, Some(store))?
-        } else {
-            content_key_for(&policy_config, None)?
-        };
 
         // Build the new snapshot from the current one — copy-on-write so
         // concurrent invokes keep using the existing config until we swap.
@@ -1396,9 +1425,25 @@ impl PolicyEngine {
         let current = self.runtime.load_full();
         let mut new_registry = current.registry.clone();
 
-        let registered =
-            register_instances_into(&mut new_registry, &policy_config.plugins, &instances);
-        if registered.is_ok() {
+        // The early lifecycle checks avoid unnecessary factory calls in the
+        // ordinary case. Repeating them beneath the writer closes the race
+        // with initialize() entering or completing while those factories ran.
+        let lifecycle = if self.initializations_in_flight.load(Ordering::Acquire) != 0 {
+            Err(config_load_during_initialization())
+        } else if self.initialized.load(Ordering::Acquire) || self.secrets.get().is_some() {
+            refuse_changed_secrets(self.secrets.get().map(Arc::as_ref), &policy_config)
+        } else {
+            Ok(())
+        };
+        let registered = lifecycle.and_then(|()| {
+            let content_key = if self.initialized.load(Ordering::Acquire) {
+                let empty = crate::secrets::SecretStore::empty();
+                let store = self.secrets.get().map_or(&empty, |s| s.as_ref());
+                content_key_for(&policy_config, Some(store))?
+            } else {
+                content_key_for(&policy_config, None)?
+            };
+            register_instances_into(&mut new_registry, &policy_config.plugins, &instances)?;
             self.runtime.store(Arc::new(snapshot_from_config(
                 new_registry,
                 policy_config,
@@ -1409,13 +1454,14 @@ impl PolicyEngine {
             // go through that helper because it has to swap registry + executor
             // + cache-cap atomically as one snapshot.
             self.generation.fetch_add(1, Ordering::Release);
-        }
+            Ok(())
+        });
         // Released before `instances`, `new_registry` and `current` fall out
         // of scope, the same discipline try_mutate_runtime follows. A
         // rejected load holds the only references to plugins the factories
         // just built, and dropping one runs host `Drop` code that is free to
-        // re-enter the engine. No `?` above, so nothing unwinds past here
-        // still holding the lock.
+        // re-enter the engine. Errors above stay in `registered`, so nothing
+        // returns from this method while it still holds the lock.
         drop(writer);
         drop(current);
         registered?;
@@ -1918,6 +1964,14 @@ impl PolicyEngine {
             return Ok(());
         };
         let config = policy_config.secrets.clone();
+        // A later initialization attempt can arrive here after an earlier one
+        // resolved secrets and then failed while attaching the content key or
+        // initializing a plugin. The OnceLock already fixes the active
+        // bindings in that case, even though `initialized` is still false.
+        if let Some(store) = self.secrets.get() {
+            refuse_changed_secrets(Some(store), policy_config)?;
+            return Ok(());
+        }
         if config.is_empty() && config.providers.is_empty() {
             return Ok(());
         }
@@ -1938,7 +1992,12 @@ impl PolicyEngine {
             })?;
 
         info!("Resolved {} secret(s)", store.names().len());
-        let _ = self.secrets.set(Arc::new(store));
+        if self.secrets.set(Arc::new(store)).is_err() {
+            // Another initialize call won the race. Identical declarations are
+            // harmless; different ones must not be hidden behind OnceLock's
+            // rejected second write.
+            refuse_changed_secrets(self.secrets.get().map(Arc::as_ref), policy_config)?;
+        }
         Ok(())
     }
 
@@ -2008,6 +2067,24 @@ impl PolicyEngine {
         if self.initialized.load(Ordering::Acquire) {
             return Ok(());
         }
+
+        // Serialize this transition with load_config's final publication
+        // check. Once the writer is released, config loads are refused until
+        // this guard drops, so every later initialization step sees one
+        // document and its matching secret declarations.
+        let _initialization = {
+            let writer = self.lock_runtime_writer();
+            if self.initialized.load(Ordering::Acquire) {
+                drop(writer);
+                return Ok(());
+            }
+            self.initializations_in_flight
+                .fetch_add(1, Ordering::AcqRel);
+            drop(writer);
+            InitializationInFlight {
+                count: &self.initializations_in_flight,
+            }
+        };
 
         // Before any plugin. A secret a plugin reads at `initialize_with` has
         // to already be resolved, and a document whose credentials cannot be
@@ -6852,6 +6929,44 @@ plugins:
     hooks: [test_hook]
 "#;
 
+    struct PausingSecretProviderFactory {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl crate::secrets::SecretProviderFactory for PausingSecretProviderFactory {
+        fn kind(&self) -> &str {
+            "pausing"
+        }
+
+        fn build(
+            &self,
+            _config: &crate::secrets::SecretProviderConfig,
+        ) -> Result<Arc<dyn crate::secrets::SecretProvider>, crate::secrets::SecretError> {
+            Ok(Arc::new(PausingSecretProvider {
+                entered: Arc::clone(&self.entered),
+                release: Arc::clone(&self.release),
+            }))
+        }
+    }
+
+    struct PausingSecretProvider {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl crate::secrets::SecretProvider for PausingSecretProvider {
+        async fn get_secret(
+            &self,
+            _reference: &str,
+        ) -> Result<zeroize::Zeroizing<String>, crate::secrets::SecretError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(zeroize::Zeroizing::new("resolved".to_owned()))
+        }
+    }
+
     /// A directory holding one secret file, and the config that reads it.
     fn secret_fixture(contents: &str) -> (std::path::PathBuf, String) {
         let dir = std::env::temp_dir().join(format!("ppe-engine-secrets-{}", uuid::Uuid::new_v4()));
@@ -6912,6 +7027,61 @@ secrets:
         assert_eq!(value.as_str(), "hunter2");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Config publication and initialization share a lifecycle gate, so a
+    /// reload cannot replace the document whose secrets are being resolved.
+    #[tokio::test]
+    async fn a_config_load_cannot_cross_secret_resolution() {
+        let yaml = "
+engine_settings:
+  dispatch: hooks
+secrets:
+  providers:
+    local: { kind: pausing }
+  values:
+    upstream_key: { provider: local, ref: upstream.key }
+";
+        let engine = Arc::new(
+            PolicyEngine::from_config(
+                parse_fixture_config(yaml).expect("config parses"),
+                &allow_factories(),
+            )
+            .expect("engine builds"),
+        );
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut providers = crate::secrets::SecretProviderRegistry::new();
+        providers.register(Box::new(PausingSecretProviderFactory {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }));
+        assert!(engine.set_secret_providers(providers));
+
+        let initializing = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move { engine.initialize().await })
+        };
+        entered.notified().await;
+
+        let changed = yaml.replace("ref: upstream.key", "ref: replacement.key");
+        let err = engine
+            .load_config(parse_fixture_config(&changed).unwrap())
+            .expect_err("a config cannot replace the document being initialized");
+        assert!(format!("{err}").contains("initialize() is in progress"));
+
+        release.notify_one();
+        initializing
+            .await
+            .expect("the initialization task does not panic")
+            .expect("the original document initializes");
+        assert_eq!(
+            resolved_secrets(&engine)
+                .value("upstream_key")
+                .expect("resolved")
+                .as_str(),
+            "resolved"
+        );
     }
 
     #[tokio::test]
@@ -6975,6 +7145,38 @@ secrets:
             msg.contains("upstream_key") && msg.contains("at least 32"),
             "{msg}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Secret resolution precedes the rest of initialization. If a later step
+    /// fails, the resolved `OnceLock` is still the binding baseline for reloads.
+    #[tokio::test]
+    async fn a_failed_initialize_still_freezes_resolved_secret_declarations() {
+        let (dir, yaml) = provenance_fixture("too-short");
+        let engine = engine_reading_secrets(&yaml);
+
+        engine
+            .initialize()
+            .await
+            .expect_err("the weak content key fails after secrets resolve");
+        assert!(!engine.is_initialized());
+        assert!(
+            !resolved_secrets(&engine).is_empty(),
+            "the store was resolved before content-key validation failed"
+        );
+
+        let changed = yaml.replace("ref: upstream.key", "ref: replacement.key");
+        let err = engine
+            .load_config(parse_fixture_config(&changed).unwrap())
+            .expect_err("the resolved store cannot be replaced on an initialization retry");
+        let msg = format!("{err}");
+        assert!(msg.contains("replacement.key"), "{msg}");
+        assert!(msg.contains("restart"), "{msg}");
+
+        engine
+            .load_config(parse_fixture_config(&yaml).unwrap())
+            .expect("an unchanged secrets block remains reloadable after the failure");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
