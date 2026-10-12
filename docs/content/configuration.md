@@ -343,12 +343,14 @@ have gone unconfirmed against the backend. It is kept across a failure, so a
 provider that has been failing for an hour still reports the success from
 before it started failing.
 
-`PolicyEngine::secrets_health(provider)` answers the other questions, as four
-states: `Uninitialized` (no store resolved, so nothing is being refreshed),
+`PolicyEngine::secrets_health(provider)` answers the other questions, as three
+variants: `Uninitialized` (no store resolved, so nothing is being refreshed),
 `Undeclared` (the document declares no such provider, so an alarm on that name
 is watching nothing), or `Resolved` carrying the last success, the most recent
-failure and its reason, and whether the most recent refresh failed. The last
-failure is kept after recovery, so a flapping provider stays visible as one.
+failure and its reason, and whether the most recent refresh failed. That last
+flag is the fourth condition: it separates a provider failing right now from one
+that is healthy. The last failure is kept after recovery, so a flapping provider
+stays visible as one.
 
 A consumer that has to act on rotation rather than just read the new bytes
 reads `SecretRef::snapshot()`, which returns the value and its generation from

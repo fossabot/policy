@@ -215,8 +215,10 @@ pub struct ProviderHealth {
 
 /// What a host can learn about a provider it names.
 ///
-/// Four states, because a single `Option` conflates them: a host cannot tell a
-/// provider that is failing from one nothing declares, nor either from a store
+/// Three variants, carrying four conditions between them: [`ProviderHealth`]'s
+/// `failing` flag separates a provider whose last refresh failed from one that
+/// is healthy. A single `Option` conflates all four, leaving a host unable to
+/// tell a failing provider from one nothing declares, or either from a store
 /// that was never built.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SecretsHealth {

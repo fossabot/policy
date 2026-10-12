@@ -260,7 +260,7 @@ impl SecretProvider for FileSecretProvider {
         }
 
         let mut raw = Zeroizing::new(String::new());
-        #[allow(
+        #[expect(
             clippy::verbose_file_reads,
             reason = "reads the descriptor containment was checked against; `fs::read_to_string` \
                       would resolve the path a second time and read whatever it resolved to then"
