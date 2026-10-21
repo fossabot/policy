@@ -82,5 +82,4 @@ one. `make help` lists the available targets.
 
 [Apache-2.0](LICENSE)
 
-
 [![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fpraxis-proxy%2Fpolicy.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2Fpraxis-proxy%2Fpolicy?ref=badge_large)
